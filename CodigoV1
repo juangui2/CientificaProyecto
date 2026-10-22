@@ -1,0 +1,133 @@
+import time
+import tracemalloc
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from ucimlrepo import fetch_ucirepo
+
+# ---------- Carga de datos ----------
+def cargar(dataset_id):
+    d = fetch_ucirepo(id=dataset_id)
+    X = d.data.features.to_numpy(dtype=float)
+    y = d.data.targets.iloc[:, 0].to_numpy().ravel()
+    return X, y
+
+def cargar_har(carpeta):
+    # Busca X_train.txt en cualquier subcarpeta
+    base = None
+    for raiz, _, archivos in os.walk(carpeta):
+        if "X_train.txt" in archivos:
+            base = os.path.dirname(raiz)   
+            break
+    if base is None:
+        raise FileNotFoundError(f"No encontré X_train.txt dentro de: {carpeta}")
+    print("Dataset encontrado en:", base)
+
+    leer = lambda ruta: pd.read_csv(os.path.join(base, ruta), sep=r"\s+", header=None)
+    Xtr, Xte = leer("train/X_train.txt").to_numpy(), leer("test/X_test.txt").to_numpy()
+    ytr, yte = leer("train/y_train.txt").to_numpy().ravel(), leer("test/y_test.txt").to_numpy().ravel()
+    return np.vstack([Xtr, Xte]), np.concatenate([ytr, yte])
+
+# ---------- Funciones base ----------
+def estandarizar(X, media=None, std=None):
+    if media is None:
+        media = X.mean(axis=0)
+        std = X.std(axis=0, ddof=1)
+        std[std == 0] = 1.0             
+    return (X - media) / std, media, std
+
+def pca_eig(Z):
+    C = np.cov(Z, rowvar=False)
+    vals, vecs = np.linalg.eigh(C)
+    idx = np.argsort(vals)[::-1]
+    return vals[idx], vecs[:, idx]
+
+def pca_svd(Z):
+    _, S, Vt = np.linalg.svd(Z, full_matrices=False)
+    return S**2 / (Z.shape[0] - 1), Vt.T
+
+def elegir_k(vals, umbral=0.95):
+    acum = np.cumsum(vals) / vals.sum()
+    return int(np.argmax(acum >= umbral)) + 1, acum
+
+# ---------- Medición de tiempo y memoria ----------
+def medir_tiempo(f, Z, reps=30):
+    f(Z)                                  # calentamiento
+    t = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        f(Z)
+        t.append(time.perf_counter() - t0)
+    return np.mean(t), np.std(t)
+
+def medir_memoria(f, Z):
+    tracemalloc.start()
+    f(Z)
+    _, pico = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return pico / 1024**2                 # MB
+
+# ---------- Clasificador simple (centroide más cercano) ----------
+def centroide(Xtr, ytr, Xte):
+    clases = np.unique(ytr)
+    cents = np.array([Xtr[ytr == c].mean(axis=0) for c in clases])
+    d = ((Xte[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2)
+    return clases[d.argmin(axis=1)]
+
+# ---------- Análisis completo ----------
+def analizar(X, y, nombre, umbral=0.95, reps=30):
+    n, m = X.shape
+    Z, _, _ = estandarizar(X)
+    print(f"\n===== {nombre}: {n} muestras x {m} variables =====")
+
+    # 1. Varianza explicada y elección de k
+    vals_e, _ = pca_eig(Z)
+    k, acum = elegir_k(vals_e, umbral)
+    print(f"k para {umbral*100:.0f}% de varianza: {k} de {m} "
+          f"(reducción del {100*(1-k/m):.1f}%)")
+    print(f"PC1 explica {100*vals_e[0]/vals_e.sum():.2f}% | "
+          f"PC1+PC2: {100*acum[1]:.2f}%")
+
+    # 2. Tiempo y memoria
+    te, se = medir_tiempo(pca_eig, Z, reps)
+    ts, ss = medir_tiempo(pca_svd, Z, reps)
+    me, ms = medir_memoria(pca_eig, Z), medir_memoria(pca_svd, Z)
+    print(f"\nTiempo autovalores: {te*1000:.2f} ± {se*1000:.2f} ms | pico memoria: {me:.1f} MB")
+    print(f"Tiempo SVD:         {ts*1000:.2f} ± {ss*1000:.2f} ms | pico memoria: {ms:.1f} MB")
+    print(f"Razón SVD/autovalores: {ts/te:.2f}x")
+
+    # 3. ¿La información reducida sigue sirviendo para clasificar?
+    rng = np.random.default_rng(42)
+    idx = rng.permutation(n)
+    ntr = int(0.7 * n)
+    tr, te_idx = idx[:ntr], idx[ntr:]
+    Ztr, mu, sd = estandarizar(X[tr])
+    Zte, _, _ = estandarizar(X[te_idx], mu, sd)
+    _, Vtr = pca_svd(Ztr)                 # PCA ajustado SOLO con entrenamiento
+
+    acc_full = np.mean(centroide(Ztr, y[tr], Zte) == y[te_idx])
+    print(f"\nExactitud con las {m} variables originales: {100*acc_full:.2f}%")
+    for kk in sorted({2, k}):
+        Ptr, Pte = Ztr @ Vtr[:, :kk], Zte @ Vtr[:, :kk]
+        acc = np.mean(centroide(Ptr, y[tr], Pte) == y[te_idx])
+        print(f"Exactitud con {kk} componentes: {100*acc:.2f}%")
+
+    return vals_e, acum
+
+# ---------- Ejecutar ----------
+RUTA_HAR = r"C:\Users\Juan\Desktop\SISTEMAS\3SEMESTRE\ComputacionCientifica\Notas\UCI HAR Dataset"
+
+X1, y1 = cargar(17)
+vals1, acum1 = analizar(X1, y1, "Caso 1: Breast Cancer")
+
+X2, y2 = cargar_har(RUTA_HAR)
+print(X2.shape, np.unique(y2))            # esperado: (10299, 561) y [1 2 3 4 5 6]
+vals2, acum2 = analizar(X2, y2, "Caso 2: HAR Smartphones", reps=5)
+
+# ---------- Gráfica de varianza acumulada ----------
+plt.plot(range(1, len(acum1)+1), acum1*100, label="Caso 1 (30 variables)")
+plt.plot(range(1, len(acum2)+1), acum2*100, label="Caso 2 (561 variables)")
+plt.axhline(95, color="gray", linestyle="--")
+plt.xscale("log"); plt.xlabel("Número de componentes"); plt.ylabel("Varianza acumulada (%)")
+plt.legend(); plt.grid(alpha=0.3); plt.show()
